@@ -19,7 +19,6 @@
       commonPackages = with pkgs; [
         nodejs_22
         pnpm
-        bun
         alejandra
         treefmt
         prettier
