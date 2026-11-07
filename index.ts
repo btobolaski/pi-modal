@@ -258,6 +258,13 @@ export default function modal(pi: ExtensionAPI) {
   let session: { id: string } | undefined;
   let revision = 0;
   const recoverySuffix = ". Select /mode auto or a valid mode.";
+  const publishStatus = (ctx: ExtensionContext) => {
+    if (ctx.hasUI)
+      ctx.ui.setStatus(
+        "pi-modal",
+        `mode: ${selection.id}${"operation" in selection ? "" : " (unavailable)"}`,
+      );
+  };
   const notify = (ctx: ExtensionContext, message: string, error = false) => {
     if (ctx.hasUI) ctx.ui.notify(message, error ? "error" : "info");
     else if (error) console.error(message);
@@ -306,12 +313,14 @@ export default function modal(pi: ExtensionAPI) {
       id,
       reason: "Restoring mode; select /mode auto to recover if necessary.",
     };
+    publishStatus(ctx);
     const { modes, errors } = await catalog(ctx);
     if (session !== identity || revision !== version) return;
     selection = (valid ? modes.get(id) : undefined) ?? {
       id,
       reason: `${errors.get(id) ?? `Saved mode ${id} is missing or malformed`}${recoverySuffix}`,
     };
+    publishStatus(ctx);
     if (!("operation" in selection) && !errors.has(id))
       notify(ctx, selection.reason, true);
   };
@@ -344,7 +353,8 @@ export default function modal(pi: ExtensionAPI) {
           };
     respond(Object.freeze(snapshot));
   });
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (ctx.hasUI) ctx.ui.setStatus("pi-modal", undefined);
     disposeQuery();
     session = undefined;
     options = undefined;
@@ -416,6 +426,7 @@ export default function modal(pi: ExtensionAPI) {
       }
       revision++;
       selection = mode;
+      publishStatus(ctx);
       notify(
         ctx,
         `Mode ${id} accepted; applies before the next agent inference, not to an in-flight request.`,
@@ -435,6 +446,7 @@ export default function modal(pi: ExtensionAPI) {
         id: selection.id,
         reason: `Cannot apply mode: ${String(error)}. Select /mode auto or a compatible mode.`,
       };
+      publishStatus(ctx);
       notify(ctx, selection.reason, true);
     }
   });

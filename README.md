@@ -52,6 +52,8 @@ Each file needs YAML frontmatter with a `replace_mode` value, followed by the in
 - `/mode` opens the picker when dialogs are available; without a dialog UI, it reports the current selection and availability.
 - `/mode auto` returns to the unchanged baseline. `status` is an ordinary mode name, not a subcommand.
 
+Pi's native footer status shows the selected mode as `mode: <name>`, including `mode: auto`. It updates as soon as a choice is accepted, even during active work: it describes the selection, not the mode used by an in-flight request. This footer status is separate from bare `/mode` reporting and the ordinary mode named `status`. Pi controls layout and truncation; narrow terminals or a custom footer may omit it. pi-modal does not replace the footer or change other extensions' statuses. Its `pi-modal` status entry is removed on session shutdown. Without a status UI, the indicator adds no console output; existing mode reports and notifications are unchanged.
+
 A selection is saved on the active session branch and takes effect at the **next agent inference**, including the next inference after tool results. It does not change a request already in progress or tool calls already generated. If you select another mode before the next inference, the latest selection wins. Internal compaction and summary calls are not projected.
 
 The active branch's last selection is restored on resume, fork, tree navigation, and reload; sibling branch selections do not carry over. A branch with no saved selection starts in `auto`. Pi handles storage; ephemeral sessions do not promise restoration after exit.
@@ -61,6 +63,8 @@ Mode contents are loaded when selected or restored, not watched. After editing a
 ### Unavailable modes
 
 If a saved mode is missing, invalid, or unreadable, pi-modal retains its name as unavailable rather than silently switching to `auto`. Normal input is blocked and native tool calls are blocked with termination requested. Select `/mode auto` or another valid mode to recover. A saved name with surrounding whitespace also remains unavailable under that exact name; it is not trimmed. A malformed saved selection is reported as `(invalid saved mode)`. A failed selection does not replace the previous one; if saving fails, retry the command.
+
+The footer shows `mode: <name> (unavailable)` while restoration is in progress or the selected mode is unavailable, including after prompt-projection failure. For malformed saved data it shows `mode: (invalid saved mode) (unavailable)`. Detailed recovery reasons remain in existing reports, not the footer. Explicitly selecting `auto` or another valid mode restores the ready text.
 
 Some incompatible or opaque prompts can also make a mode unavailable. This readiness check is **not a security or cancellation guarantee**: Pi may log prompt-hook exceptions without cancelling a request, and other extensions, direct I/O, later prompt overrides, and internal compaction or summary calls are outside the gate.
 

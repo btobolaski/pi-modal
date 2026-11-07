@@ -18,6 +18,42 @@ import {
   query,
   savedChoices,
 } from "./test-helpers.ts";
+function recordStatus(
+  f: Parameters<typeof mockPicker>[0],
+  select: Parameters<typeof mockPicker>[1] = async () => undefined,
+  notify?: Parameters<typeof mockPicker>[2],
+) {
+  const statuses = new Map<string, string | undefined>();
+  mockPicker(f, select, notify, (key, text) => statuses.set(key, text));
+  return statuses;
+}
+
+test("native status publishes restored readiness and removes its entry on shutdown", async (t) => {
+  const f = await nativeFixture(t);
+  const statuses = recordStatus(f);
+  statuses.set("other-extension", "keep me");
+  await f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "startup",
+  });
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
+  f.sm.appendCustomEntry("pi-modal:mode", { id: "missing" });
+  await f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "resume",
+  });
+  assert.equal(statuses.get("pi-modal"), "mode: missing (unavailable)");
+  assert.equal(query(f)?.id, "missing");
+  assert.equal(query(f)?.ready, false);
+  await f.session.prompt("/mode auto");
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
+  await f.session.extensionRunner.emit({ type: "session_shutdown", reason: "new" });
+  assert.deepEqual([...statuses], [
+    ["other-extension", "keep me"],
+    ["pi-modal", undefined],
+  ]);
+});
+
 // These phases form one causal chain: each choice changes the next busy boundary.
 // Split future independent phases only when doing so removes repeated setup.
 test("native busy commands accept latest valid choice through streaming, tool loops and queued continuation", async (t) => {
@@ -58,13 +94,15 @@ test("native busy commands accept latest valid choice through streaming, tool lo
   ]);
   const running = f.session.prompt("start");
   await entered.promise;
-  mockPicker(f, async () => {
+  const statuses = recordStatus(f, async () => {
     f.sm.appendCustomEntry("work advanced while busy picker awaited");
     return "A";
   });
   await f.session.prompt("/mode");
+  assert.equal(statuses.get("pi-modal"), "mode: A");
   await f.session.prompt("queued", { streamingBehavior: "followUp" });
   await f.session.prompt("/mode B");
+  assert.equal(statuses.get("pi-modal"), "mode: B");
   const accepted = savedChoices(f.sm).length;
   await f.session.prompt("/mode ../A");
   assert.equal(savedChoices(f.sm).length, accepted);
@@ -100,12 +138,38 @@ test("completion and headless status do not reserve a status subcommand", async 
     ["auto", "A", "B", "none", "status"],
   );
   assert.equal(await command.getArgumentCompletions!("unknown"), null);
+  assert.deepEqual(output, [], "headless startup adds no status chatter");
   await f.session.prompt("/mode");
-  assert.ok(output.some((message) => message.includes("auto (ready)")));
+  assert.deepEqual(output, ["Mode: auto (ready)"]);
   assert.equal(savedChoices(f.sm).length, 0);
   await f.session.prompt("/mode status");
   assert.equal(query(f)?.id, "status");
+  assert.deepEqual(output, [
+    "Mode: auto (ready)",
+    "Mode status accepted; applies before the next agent inference, not to an in-flight request.",
+  ]);
+  await f.session.prompt("/mode");
+  assert.equal(output.at(-1), "Mode: status (ready)");
 });
+test("status preserves exact case and spaces for direct, picker and None selections", async (t) => {
+  const f = await nativeFixture(t);
+  await writeFile(join(f.agentDir, "modes/Review Notes.md"), definition("None"));
+  const statuses = recordStatus(f, async () => "Review Notes");
+  await f.session.prompt("/mode Review Notes");
+  assert.equal(statuses.get("pi-modal"), "mode: Review Notes");
+  await f.session.prompt("/mode auto");
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
+  await f.session.prompt("/mode");
+  assert.equal(statuses.get("pi-modal"), "mode: Review Notes");
+  assert.deepEqual(query(f), {
+    sessionId: f.sm.getSessionId(),
+    id: "Review Notes",
+    ready: true,
+  });
+  await f.session.prompt("/mode none");
+  assert.equal(statuses.get("pi-modal"), "mode: none");
+});
+
 test("filename eligibility excludes padded stems but keeps exact internal-space names selectable", async (t) => {
   captureConsole(t, "error");
   const f = await nativeFixture(t);
@@ -241,6 +305,32 @@ test("picker revalidation deduplicates failures without hiding changes or later 
   assert.equal(errors.length, 4);
   assert.equal(savedChoices(f.sm).length, count);
 });
+test("cancelled, invalid and unsaved choices leave selection and status unchanged", async (t) => {
+  const f = await nativeFixture(t);
+  const statuses = recordStatus(f);
+  await f.session.prompt("/mode A");
+  const before = query(f);
+  const previousStatus = [...statuses];
+  await writeFile(join(f.agentDir, "modes/bad.md"), definition("invalid"));
+  for (const command of ["/mode", "/mode missing", "/mode bad"]) {
+    await f.session.prompt(command);
+    assert.deepEqual(query(f), before);
+    assert.deepEqual([...statuses], previousStatus);
+  }
+  const append = t.mock.method(f.sm, "appendCustomEntry", () => {
+    assert.deepEqual([...statuses], previousStatus);
+    throw new Error("disk full");
+  });
+  await f.session.prompt("/mode B");
+  assert.deepEqual(query(f), before);
+  assert.deepEqual([...statuses], previousStatus);
+  assert.deepEqual(
+    savedChoices(f.sm).map((entry) => entry.data),
+    [{ id: "A" }],
+  );
+  append.mock.restore();
+});
+
 test("a mode-file read may overlap leaf advancement without discarding selection", async (t) => {
   const f = await nativeFixture(t);
   const { entered, release } = holdModeRead(t, "B");
@@ -273,7 +363,12 @@ test("session shutdown invalidates an outstanding picker", async (t) => {
 });
 test("native tree and persisted session restoration use only the active branch", async (t) => {
   const f = await nativeFixture(t, [], true);
-  const snapshot = () => query(f);
+  const statuses = recordStatus(f);
+  const snapshot = () => {
+    const value = query(f);
+    assert.equal(statuses.get("pi-modal"), `mode: ${value?.id}`);
+    return value;
+  };
   const root = f.sm.appendCustomEntry("root");
   await f.session.prompt("/mode A");
   const a = f.sm.getLeafId()!;
@@ -303,6 +398,12 @@ test("native tree and persisted session restoration use only the active branch",
   for (const [i, manager] of managers.entries()) {
     const opened = await f.open(manager, i === 0 ? "resume" : "fork");
     assert.equal(query(opened)?.id, "B");
+    const restoredStatus = recordStatus(opened);
+    await opened.session.extensionRunner.emit({
+      type: "session_start",
+      reason: i === 0 ? "resume" : "fork",
+    });
+    assert.equal(restoredStatus.get("pi-modal"), "mode: B");
     opened.session.dispose();
   }
   for (const entry of savedChoices(f.sm))
@@ -401,6 +502,7 @@ test("direct invalid selection and restoration report one actionable failure per
 test("malformed saved ids cannot become a ready placeholder or implicit auto", async (t) => {
   captureConsole(t, "error");
   const f = await nativeFixture(t);
+  const statuses = recordStatus(f);
   await writeFile(
     join(f.agentDir, "modes/(invalid saved mode).md"),
     definition("None"),
@@ -422,6 +524,10 @@ test("malformed saved ids cannot become a ready placeholder or implicit auto", a
     assert.equal(query(f)?.id, "(invalid saved mode)");
     assert.ok(query(f)?.reason);
   }
+  assert.equal(
+    statuses.get("pi-modal"),
+    "mode: (invalid saved mode) (unavailable)",
+  );
   await f.session.prompt("/mode auto");
   assert.deepEqual(query(f), {
     sessionId: f.sm.getSessionId(),
@@ -429,6 +535,7 @@ test("malformed saved ids cannot become a ready placeholder or implicit auto", a
     ready: true,
   });
   assert.deepEqual(savedChoices(f.sm).at(-1)?.data, { id: "auto" });
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
 });
 test("an unavailable saved definition consumes input, terminates tools, and requires recovery", async (t) => {
   const errors = captureConsole(t, "error");
@@ -475,8 +582,50 @@ test("an unavailable saved definition consumes input, terminates tools, and requ
   await f.session.prompt("ordinary input works again");
   assert.equal(f.session.getLastAssistantText(), "recovered");
 });
+test("projection failure publishes unavailable status and retains actionable reporting", async (t) => {
+  const f = await nativeFixture(t, [
+    (pi) => {
+      pi.on("before_agent_start", (event) => {
+        event.systemPromptOptions.forceSystemPrompt = "OPAQUE";
+      });
+    },
+  ]);
+  const errors: string[] = [];
+  const statuses = recordStatus(f, undefined, (message, type) => {
+    if (type === "error") errors.push(message);
+  });
+  await f.session.prompt("/mode B");
+  assert.equal(statuses.get("pi-modal"), "mode: B");
+  f.faux.setResponses([fauxAssistantMessage("ok")]);
+  await f.session.prompt("check projection");
+  assert.equal(query(f)?.ready, false);
+  assert.equal(query(f)?.id, "B");
+  assert.equal(statuses.get("pi-modal"), "mode: B (unavailable)");
+  assert.match(errors.at(-1) ?? "", /Cannot apply mode.*\/mode auto/);
+});
+
+test("shutdown prevents a pending restoration from republishing status", async (t) => {
+  const f = await nativeFixture(t);
+  const statuses = recordStatus(f);
+  await f.session.prompt("/mode A");
+  const { entered, release } = holdModeRead(t, "A");
+  const restoring = f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "reload",
+  });
+  await entered.promise;
+  assert.equal(statuses.get("pi-modal"), "mode: A (unavailable)");
+  await f.session.extensionRunner.emit({ type: "session_shutdown", reason: "new" });
+  assert.equal(statuses.get("pi-modal"), undefined);
+  release.resolve();
+  await restoring;
+  assert.equal(statuses.get("pi-modal"), undefined);
+  assert.equal(query(f), undefined);
+});
+
 test("restoration clears stale ready text before I/O and cannot overwrite a newer accepted choice", async (t) => {
   const f = await nativeFixture(t);
+  const statuses = recordStatus(f);
   await f.session.prompt("/mode A");
   const { entered, release } = holdModeRead(t, "A");
   const restoring = f.session.extensionRunner.emit({
@@ -487,9 +636,12 @@ test("restoration clears stale ready text before I/O and cannot overwrite a newe
   });
   await entered.promise;
   assert.equal(query(f)?.ready, false);
+  assert.equal(statuses.get("pi-modal"), "mode: A (unavailable)");
   await f.session.prompt("/mode auto");
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
   release.resolve();
   await restoring;
+  assert.equal(statuses.get("pi-modal"), "mode: auto");
   assert.deepEqual(query(f), {
     sessionId: f.sm.getSessionId(),
     id: "auto",

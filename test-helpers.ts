@@ -171,10 +171,12 @@ export function mockPicker(
   f: { session: AgentSession },
   select: ExtensionUIContext["select"],
   notify: ExtensionUIContext["notify"] = () => {},
+  setStatus: ExtensionUIContext["setStatus"] = () => {},
 ) {
-  // SAFETY: pi-modal's UI paths call only select/notify; all other UI methods are outside these fixtures.
+  // SAFETY: pi-modal's UI paths call only select/notify/setStatus; other UI methods are outside these fixtures.
   f.session.extensionRunner.setUIContext({
     notify,
     select,
+    setStatus,
   } as unknown as ExtensionUIContext);
 }
