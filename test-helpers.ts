@@ -23,6 +23,7 @@ export async function nativeFixture(
   t: TestContext,
   extensionFactories: ((pi: ExtensionAPI) => void)[] = [],
   persistent = false,
+  flags: Record<string, string | boolean> = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), "pi-modal-native-"));
   const agentDir = join(dir, "agent");
@@ -73,6 +74,7 @@ export async function nativeFixture(
     sm: SessionManager,
     reason: SessionStartEvent["reason"] = "startup",
     sessionCwd = cwd,
+    flagValues = flags,
   ) => {
     const bus = createEventBus();
     const loader = new DefaultResourceLoader({
@@ -89,7 +91,9 @@ export async function nativeFixture(
     });
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
-    const { session } = await createAgentSession({
+    for (const [name, value] of Object.entries(flagValues))
+      loader.getExtensions().runtime.flagValues.set(name, value);
+    const created = await createAgentSession({
       cwd: sessionCwd,
       agentDir,
       modelRuntime: runtime,
@@ -99,6 +103,7 @@ export async function nativeFixture(
       settingsManager,
       sessionStartEvent: { type: "session_start", reason },
     });
+    const { session } = created;
     const extensionErrors: unknown[] = [];
     await session.bindExtensions({
       onError: (error) => extensionErrors.push(error),
@@ -114,7 +119,21 @@ export async function nativeFixture(
             "provider assertions must propagate",
           );
     });
-    return { sm, session, bus, loader };
+    return {
+      ...created,
+      sm,
+      bus,
+      loader,
+      services: {
+        cwd: sessionCwd,
+        agentDir,
+        modelRuntime: runtime,
+        settingsManager,
+        resourceLoader: loader,
+        diagnostics: [],
+      },
+      diagnostics: [],
+    };
   };
   const sm = persistent
     ? SessionManager.create(cwd, join(dir, "sessions"))

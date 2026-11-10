@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
+import {
+  AgentSessionRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import {
   fauxAssistantMessage,
   fauxToolCall,
@@ -28,6 +33,205 @@ function recordStatus(
   return statuses;
 }
 
+function assertChoice(f: Parameters<typeof query>[0], id: string) {
+  assert.equal(query(f)?.id, id);
+  assert.equal(query(f)?.ready, true);
+  assert.deepEqual(savedChoices(f.sm).at(-1)?.data, { id });
+}
+
+test("startup selects before inference, overrides saved choices, and accepts exact names and auto", async (t) => {
+  const output = captureConsole(t, "info"),
+    errors = captureConsole(t, "error");
+  const f = await nativeFixture(t, [], false, { modal: "A" });
+  const flag = f.loader.getExtensions().extensions[0].flags.get("modal")!;
+  assert.equal(flag.type, "string");
+  assert.equal(Object.hasOwn(flag, "default"), false);
+  assertChoice(f, "A");
+  assert.equal(savedChoices(f.sm).length, 1);
+  assert.deepEqual(output, []);
+  assert.equal(f.faux.state.callCount, 0);
+  f.faux.setResponses([
+    (context) => {
+      const prompt = getCurrentSystemPrompt(context.messages);
+      assert.ok(
+        prompt.includes("GLOBAL") &&
+          prompt.includes("\nA\n</project_instructions>"),
+      );
+      assert.equal(/ANCESTOR|PROJECT/.test(prompt), false);
+      return fauxAssistantMessage("ok");
+    },
+  ]);
+  await f.session.prompt("first inference");
+  assert.equal(f.faux.state.callCount, 1);
+  await writeFile(
+    join(f.agentDir, "modes/Review Notes.md"),
+    definition("None"),
+  );
+  await writeFile(join(f.agentDir, "modes/bad.md"), definition("invalid"));
+  const sm = SessionManager.inMemory(f.cwd);
+  sm.appendCustomEntry("pi-modal:mode", { id: "B" });
+  const exact = await f.open(sm, "startup", f.cwd, { modal: "Review Notes" });
+  assertChoice(exact, "Review Notes");
+  assert.equal(savedChoices(sm).length, 2);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /bad.md.*replace_mode/);
+  await rm(join(f.agentDir, "modes"), { recursive: true });
+  errors.length = 0;
+  const recovered = await f.open(sm, "startup", f.cwd, { modal: "auto" });
+  assertChoice(recovered, "auto");
+  assert.deepEqual(errors, [], "unavailable saved mode is bypassed");
+  assert.equal(
+    sm.getSessionFile(),
+    undefined,
+    "ephemeral selection is in memory",
+  );
+});
+
+test("native CLI registration and fatal rejection precede prompts, saving and status acceptance", async (t) => {
+  const f = await nativeFixture(t, [], true, { modal: "A" });
+  f.faux.setResponses([fauxAssistantMessage("persist")]);
+  await f.session.prompt("persist the prior choice");
+  for (const [id, body] of [
+    ["Review Notes", definition("None")],
+    ["unreadable", definition("None")],
+    ["malformed", "---\nreplace_mode: [\n---"],
+    ["excluded", definition("invalid")],
+  ])
+    await writeFile(join(f.agentDir, "modes", id + ".md"), body);
+  const probe = join(f.dir, "probe.mjs"),
+    boot = join(f.dir, "cli.mjs");
+  await writeFile(
+    probe,
+    `
+    import fs from "node:fs/promises";
+    import assert from "node:assert/strict";
+    import { writeSync } from "node:fs";
+    import { query, savedChoices } from ${JSON.stringify(new URL("./test-helpers.ts", import.meta.url).href)};
+    import { fauxProvider } from ${JSON.stringify(import.meta.resolve("@earendil-works/pi-ai"))};
+    import { SessionManager } from ${JSON.stringify(import.meta.resolve("@earendil-works/pi-coding-agent"))};
+    const append = SessionManager.prototype.appendCustomEntry, read = fs.readFile;
+    SessionManager.prototype.appendCustomEntry = function(type, data) {
+      if (process.env.MODAL_SAVE_FAIL && type === "pi-modal:mode") throw new Error("disk full");
+      return append.call(this, type, data);
+    };
+    fs.readFile = (path, ...args) => String(path).endsWith("/unreadable.md")
+      ? Promise.reject(new Error("EACCES: permission denied")) : read(path, ...args);
+    export default function(pi) {
+      const faux = fauxProvider({ provider: "modal-cli" });
+      pi.registerProvider(faux.provider);
+      let promptReached = false;
+      pi.on("input", () => { promptReached = true; return { action: "handled" }; });
+      pi.on("session_start", (event, ctx) => {
+        const statuses = [], setStatus = ctx.ui.setStatus;
+        ctx.ui.setStatus = (key, text) => { statuses.push([key, text]); setStatus(key, text); };
+        process.on("exit", () => {
+          assert.equal(ctx.mode, process.env.MODAL_TUI ? "tui" : "json");
+          assert.equal(event.reason, "startup");
+          assert.deepEqual(query({ sm: ctx.sessionManager, bus: pi.events }), {
+            sessionId: ctx.sessionManager.getSessionId(), id: "auto", ready: true,
+          });
+          assert.deepEqual(savedChoices(ctx.sessionManager).map(e => e.data), [{ id: "A" }]);
+          assert.deepEqual(statuses, []);
+          assert.equal(promptReached, false);
+          assert.equal(faux.state.callCount, 0);
+          writeSync(2, "\\nSTATE_CHECKED\\n");
+        });
+      });
+    }
+  `,
+  );
+  // Pi 1.5.0's unbundled CLI shares SDK modules with the injected faults.
+  await writeFile(
+    boot,
+    `
+    if (process.env.MODAL_TUI) {
+      Object.defineProperty(process.stdin, "isTTY", { value: true });
+      Object.defineProperties(process.stdout, { isTTY: { value: true }, columns: { value: 80 }, rows: { value: 24 } });
+      process.stdin.setRawMode = () => process.stdin;
+    }
+    await import(${JSON.stringify(new URL("./node_modules/@earendil-works/pi-coding-agent/dist/cli.js", import.meta.url).href)});
+  `,
+  );
+  const base = [
+    "--offline",
+    "--no-extensions",
+    "-e",
+    probe,
+    "-e",
+    fileURLToPath(new URL("./index.ts", import.meta.url)),
+    "--session",
+    f.sm.getSessionFile()!,
+    "--model",
+    "modal-cli/faux-1",
+  ];
+  const run = (args: string[], tui = false, saveFailure = false) => {
+    const result = spawnSync(
+      process.execPath,
+      [boot, ...base, ...(tui ? [] : ["--mode", "json"]), ...args],
+      {
+        cwd: f.cwd,
+        input: "",
+        encoding: "utf8",
+        timeout: 20_000,
+        env: {
+          ...process.env,
+          MODAL_TUI: tui ? "1" : "",
+          MODAL_SAVE_FAIL: saveFailure ? "1" : "",
+        },
+      },
+    );
+    assert.ifError(result.error);
+    return result;
+  };
+  const help = run(["--help"]);
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout + help.stderr, /--modal <value>/);
+  const missing = run(["--modal"]);
+  assert.equal(missing.status, 1, missing.stderr);
+  assert.match(missing.stderr, /Extension flag "--modal" requires a value/);
+  assert.doesNotMatch(help.stderr + missing.stderr, /STATE_CHECKED/);
+  for (const [value, reason, tui = false, saveFailure = false] of [
+    ["", /Unknown mode/],
+    ["missing", /Unknown mode/],
+    [" A ", /Unknown mode/],
+    ["../A", /Unknown mode/],
+    ["review notes", /Unknown mode/],
+    ["malformed", /Invalid mode.*malformed.md/],
+    ["excluded", /replace_mode/],
+    ["unreadable", /EACCES/],
+    ["B", /Cannot save mode B.*disk full/, true, true],
+  ] as const) {
+    const result = run(["--modal", value, "sentinel prompt"], tui, saveFailure);
+    assert.equal(result.status, 1, result.stderr);
+    const fatal = result.stderr.slice(
+      result.stderr.lastIndexOf("pi-modal: --modal"),
+    );
+    assert.ok(
+      fatal.includes(`--modal ${JSON.stringify(value)} rejected:`),
+      fatal,
+    );
+    assert.match(fatal, reason);
+    assert.match(fatal, /Choose --modal auto.*omit --modal/);
+    assert.doesNotMatch(fatal, /rejected: Error:|\.\. Choose|retry \/mode/);
+    assert.equal(result.stdout.includes("pi-modal:"), false);
+    assert.ok(result.stderr.endsWith("\nSTATE_CHECKED\n"), result.stderr);
+    if (!tui)
+      assert.ok(
+        result.stdout
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .every((line) => JSON.parse(line).type === "session"),
+      );
+  }
+  assert.deepEqual(
+    savedChoices(SessionManager.open(f.sm.getSessionFile()!)).map(
+      (e) => e.data,
+    ),
+    [{ id: "A" }],
+  );
+});
+
 test("native status publishes restored readiness and removes its entry on shutdown", async (t) => {
   const f = await nativeFixture(t);
   const statuses = recordStatus(f);
@@ -37,6 +241,13 @@ test("native status publishes restored readiness and removes its entry on shutdo
     reason: "startup",
   });
   assert.equal(statuses.get("pi-modal"), "mode: auto");
+  f.session.extensionRunner.setFlagValue("modal", "A");
+  await f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "startup",
+  });
+  assertChoice(f, "A");
+  assert.equal(statuses.get("pi-modal"), "mode: A");
   f.sm.appendCustomEntry("pi-modal:mode", { id: "missing" });
   await f.session.extensionRunner.emit({
     type: "session_start",
@@ -362,15 +573,14 @@ test("session shutdown invalidates an outstanding picker", async (t) => {
   assert.equal(savedChoices(f.sm).length, before);
 });
 test("native tree and persisted session restoration use only the active branch", async (t) => {
-  const f = await nativeFixture(t, [], true);
+  const f = await nativeFixture(t, [], true, { modal: "A" });
   const statuses = recordStatus(f);
   const snapshot = () => {
     const value = query(f);
     assert.equal(statuses.get("pi-modal"), `mode: ${value?.id}`);
     return value;
   };
-  const root = f.sm.appendCustomEntry("root");
-  await f.session.prompt("/mode A");
+  const root = f.sm.getBranch()[0].id;
   const a = f.sm.getLeafId()!;
   await f.session.navigateTree(root, { summarize: false });
   assert.equal(snapshot()?.id, "auto");
@@ -396,7 +606,12 @@ test("native tree and persisted session restoration use only the active branch",
     SessionManager.open(cloneFile),
   ];
   for (const [i, manager] of managers.entries()) {
-    const opened = await f.open(manager, i === 0 ? "resume" : "fork");
+    const opened = await f.open(
+      manager,
+      i === 0 ? "startup" : "fork",
+      f.cwd,
+      i === 0 ? {} : { modal: "A" },
+    );
     assert.equal(query(opened)?.id, "B");
     const restoredStatus = recordStatus(opened);
     await opened.session.extensionRunner.emit({
@@ -408,15 +623,54 @@ test("native tree and persisted session restoration use only the active branch",
   }
   for (const entry of savedChoices(f.sm))
     assert.deepEqual(Object.keys(entry.data as object), ["id"]);
+  const count = savedChoices(f.sm).length;
+  const user = f.sm
+    .getBranch()
+    .find((e) => e.type === "message" && e.message.role === "user")!;
+  let current: Awaited<ReturnType<typeof f.open>> = f;
+  const host = new AgentSessionRuntime(
+    f.session,
+    f.services,
+    async (options) => {
+      current = await f.open(
+        options.sessionManager,
+        options.sessionStartEvent?.reason,
+        options.cwd,
+      );
+      return current;
+    },
+  );
+  for (const [replace, id, choices] of [
+    [() => host.newSession(), "auto", 0],
+    [() => host.switchSession(sessionFile), "B", count],
+    [() => host.fork(a, { position: "at" }), "A", 1],
+    [() => host.switchSession(sessionFile), "B", count],
+    [() => host.fork(user.id), "B", count],
+  ] as const) {
+    const previous = current;
+    await replace();
+    assert.equal(query(previous), undefined, "outgoing runtime was shut down");
+    assert.equal(
+      current.session.extensionRunner.getFlagValues().get("modal"),
+      "A",
+    );
+    assert.equal(query(current)?.id, id);
+    assert.equal(savedChoices(current.sm).length, choices);
+  }
+  await host.dispose();
 });
 test("reload reads current body and native compaction retains the selected id", async (t) => {
-  const f = await nativeFixture(t);
+  const f = await nativeFixture(t, [], false, { modal: "A" });
   await f.session.prompt("/mode B");
   await writeFile(
     join(f.agentDir, "modes", "B.md"),
     definition("Append", "RELOADED"),
   );
+  const previous = f.loader.getExtensions().extensions[0];
   await f.session.reload();
+  assert.notEqual(f.loader.getExtensions().extensions[0], previous);
+  assert.equal(f.session.extensionRunner.getFlagValues().get("modal"), "A");
+  assert.equal(savedChoices(f.sm).length, 2);
   assert.equal(query(f)?.id, "B");
   f.faux.setResponses([
     (context) => {
@@ -604,10 +858,27 @@ test("projection failure publishes unavailable status and retains actionable rep
   assert.match(errors.at(-1) ?? "", /Cannot apply mode.*\/mode auto/);
 });
 
-test("shutdown prevents a pending restoration from republishing status", async (t) => {
+test("session replacement and shutdown invalidate pending startup and restoration reads", async (t) => {
   const f = await nativeFixture(t);
   const statuses = recordStatus(f);
   await f.session.prompt("/mode A");
+  const before = savedChoices(f.sm).length;
+  const held = holdModeRead(t, "A");
+  f.session.extensionRunner.setFlagValue("modal", "B");
+  const starting = f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "startup",
+  });
+  await held.entered.promise;
+  const replacing = f.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "new",
+  });
+  held.release.resolve();
+  await Promise.all([starting, replacing]);
+  assertChoice(f, "A");
+  assert.equal(statuses.get("pi-modal"), "mode: A");
+  assert.equal(savedChoices(f.sm).length, before);
   const { entered, release } = holdModeRead(t, "A");
   const restoring = f.session.extensionRunner.emit({
     type: "session_start",

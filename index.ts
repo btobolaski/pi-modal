@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 // Keep fs methods interceptable by native checks with t.mock.method.
 import fs from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -253,6 +254,11 @@ export function projectMessages(
 }
 
 export default function modal(pi: ExtensionAPI) {
+  pi.registerFlag("modal", {
+    description:
+      "Select instruction mode at startup (auto or an exact custom name)",
+    type: "string",
+  });
   let options: NormalizedBuildSystemPromptOptions | undefined;
   let selection: Mode | { id: string; reason: string } = auto;
   let session: { id: string } | undefined;
@@ -324,10 +330,42 @@ export default function modal(pi: ExtensionAPI) {
     if (!("operation" in selection) && !errors.has(id))
       notify(ctx, selection.reason, true);
   };
-  pi.on("session_start", async (_event, ctx) => {
-    session = { id: ctx.sessionManager.getSessionId() };
+  const accept = (mode: Mode) => {
+    try {
+      pi.appendEntry("pi-modal:mode", { id: mode.id });
+    } catch (error) {
+      throw new Error(
+        `Cannot save mode ${mode.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    revision++;
+    selection = mode;
+  };
+  pi.on("session_start", async (event, ctx) => {
+    const identity = (session = { id: ctx.sessionManager.getSessionId() });
     options = undefined;
-    await restore(ctx);
+    const requested = pi.getFlag("modal");
+    if (event.reason !== "startup" || typeof requested !== "string") {
+      await restore(ctx);
+      return;
+    }
+    try {
+      const { modes, errors } = await catalog(ctx);
+      if (session !== identity) return;
+      const mode = modes.get(requested);
+      if (!mode)
+        throw new Error(errors.get(requested) ?? `Unknown mode: ${requested}`);
+      accept(mode);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      writeSync(
+        2,
+        `pi-modal: --modal ${JSON.stringify(requested)} rejected: ${reason}\nChoose --modal auto or a valid exact mode name, or omit --modal.\n`,
+      );
+      // Graceful shutdown does not stop print-mode startup prompts.
+      process.exit(1);
+    }
+    publishStatus(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
     await restore(ctx);
@@ -415,17 +453,15 @@ export default function modal(pi: ExtensionAPI) {
         return;
       }
       try {
-        pi.appendEntry("pi-modal:mode", { id });
+        accept(mode);
       } catch (error) {
         notify(
           ctx,
-          `Cannot save mode ${id}: ${String(error)}. Previous selection retained; retry /mode ${id}.`,
+          `${error instanceof Error ? error.message : String(error)}. Previous selection retained; retry /mode ${id}.`,
           true,
         );
         return;
       }
-      revision++;
-      selection = mode;
       publishStatus(ctx);
       notify(
         ctx,

@@ -18,6 +18,7 @@ test("query is silent before initialization and rejects malformed/wrong-session 
     events: bus,
     on: () => () => {},
     registerCommand: () => {},
+    registerFlag: () => {},
   } as unknown as ExtensionAPI);
   let responses = 0;
   bus.emit("pi-modal:query", {

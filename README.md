@@ -1,8 +1,8 @@
 # pi-modal
 
-Switch the instructions Pi uses for a session without editing your `AGENTS.md` files. Define modes as Markdown files, then choose one with `/mode`—for example, a review mode that replaces project instructions with review-specific guidance.
+Switch the instructions Pi uses for a session without editing your `AGENTS.md` files. Define modes as Markdown files, then choose one with `--modal` at startup or `/mode` in Pi—for example, a review mode that replaces project instructions with review-specific guidance.
 
-pi-modal is tested with **Pi 1.5.0**. Its prompt integration depends on that version's format; other versions may not work.
+pi-modal is tested with **Pi 1.5.0**. Its prompt format, extension-flag APIs, and startup lifecycle depend on that version; other versions may not work.
 
 ## Getting started
 
@@ -23,13 +23,21 @@ replace_mode: ReplaceProject
 Review changes for correctness. Do not modify files.
 ```
 
-In Pi, select it with `/mode review`. Run `/mode` to choose from a picker, or `/mode auto` to return to Pi's unchanged instructions. Only one mode is selected at a time; `auto` is the default and needs no file.
+Start with a mode already selected (include `-e /path/to/pi-modal` for one-off use):
+
+```sh
+pi --modal review
+pi --modal auto
+pi --modal "Review Notes"  # requires modes/Review Notes.md
+```
+
+Or select it in Pi with `/mode review`. Run `/mode` to choose from a picker, or `/mode auto` to return to Pi's unchanged instructions. Only one mode is selected at a time; without a saved choice or `--modal`, `auto` is the default and needs no file. `--modal` is separate from Pi's built-in output-format `--mode text|json|rpc`; they can be used together.
 
 The example replaces the loaded **project** instructions for subsequent agent requests. It does not change the files on disk, erase conversation history, or prevent tools from modifying files. Instructions are not a permission boundary.
 
 ## Writing modes
 
-Put each mode in a direct `<name>.md` file under the Pi agent directory's `modes/` folder. The default is `~/.pi/agent/modes/`; Pi's `PI_CODING_AGENT_DIR` setting changes the agent directory. The filename stem is the name used with `/mode` and is case-sensitive. Internal spaces are allowed; surrounding whitespace is rejected, not trimmed. Subdirectories and non-Markdown files are ignored. Symlinks to regular files are supported; non-regular targets are reported as invalid without reading them.
+Put each mode in a direct `<name>.md` file under the Pi agent directory's `modes/` folder. The default is `~/.pi/agent/modes/`; Pi's `PI_CODING_AGENT_DIR` setting changes the agent directory. The filename stem is the name used with `--modal` and `/mode` and is case-sensitive. Internal spaces are allowed; surrounding whitespace is rejected, not trimmed. Subdirectories and non-Markdown files are ignored. Symlinks to regular files are supported; non-regular targets are reported as invalid without reading them.
 
 Each file needs YAML frontmatter with a `replace_mode` value, followed by the instructions in the Markdown body. Other frontmatter is ignored; the body may be empty. Pi normalizes BOMs and newlines and trims the body of a file with frontmatter. Available values are:
 
@@ -48,6 +56,7 @@ Each file needs YAML frontmatter with a `replace_mode` value, followed by the in
 
 ## Selecting and updating modes
 
+- `pi --modal <name>` selects and saves an exact mode name before startup prompts. Quote names containing spaces; empty or surrounding-whitespace values are rejected, not normalized.
 - `/mode <name>` selects a mode. Completion lists valid names.
 - `/mode` opens the picker when dialogs are available; without a dialog UI, it reports the current selection and availability.
 - `/mode auto` returns to the unchanged baseline. `status` is an ordinary mode name, not a subcommand.
@@ -56,13 +65,17 @@ Pi's native footer status shows the selected mode as `mode: <name>`, including `
 
 A selection is saved on the active session branch and takes effect at the **next agent inference**, including the next inference after tool results. It does not change a request already in progress or tool calls already generated. If you select another mode before the next inference, the latest selection wins. Internal compaction and summary calls are not projected.
 
-The active branch's last selection is restored on resume, fork, tree navigation, and reload; sibling branch selections do not carry over. A branch with no saved selection starts in `auto`. Pi handles storage; ephemeral sessions do not promise restoration after exit.
+`--modal` overrides the initially opened branch's saved choice once, including when starting Pi with a resumed session. It does not lock the mode: later `/mode` choices, tree navigation, reload, and new/resumed/forked/cloned sessions in the process use normal restoration, without reapplying the original flag.
+
+Otherwise the active branch's last selection is restored on resume, fork, tree navigation, and reload; sibling branch selections do not carry over. A branch with no saved selection starts in `auto`. A later launch without `--modal` restores the saved choice when reopening that branch. Pi handles storage with its native guarantees; an accepted choice in an ephemeral session is in memory only and does not promise restoration after exit.
 
 Mode contents are loaded when selected or restored, not watched. After editing a mode file, reselect it or use `/reload` to pick up the changes. Switching modes starts from the current baseline, so instructions from previous modes do not accumulate.
 
 ### Unavailable modes
 
-If a saved mode is missing, invalid, or unreadable, pi-modal retains its name as unavailable rather than silently switching to `auto`. Normal input is blocked and native tool calls are blocked with termination requested. Select `/mode auto` or another valid mode to recover. A saved name with surrounding whitespace also remains unavailable under that exact name; it is not trimmed. A malformed saved selection is reported as `(invalid saved mode)`. A failed selection does not replace the previous one; if saving fails, retry the command.
+An explicit invalid `--modal` value (empty, unknown, path-like, unreadable, or malformed), or a failure to save that startup choice, writes an actionable diagnostic to **stderr** and exits with status **1** before Pi processes startup prompt text. This applies to interactive, print/text, JSON, and RPC operation; there is no silent fallback. Validation failure appends no choice. Pi handles a missing flag argument itself. Fatal startup rejection exits directly and **bypasses graceful shutdown hooks**, including other extensions' cleanup; it does not undo work already performed by earlier extension initialization. Use `pi --modal auto` to override even an unavailable saved mode without needing a modes directory, or omit the flag to use normal restoration. Unrelated invalid definitions do not reject a valid requested mode.
+
+Without the flag, if a saved mode is missing, invalid, or unreadable, pi-modal retains its name as unavailable rather than silently switching to `auto`. Normal input is blocked and native tool calls are blocked with termination requested. Select `/mode auto` or another valid mode to recover. A saved name with surrounding whitespace also remains unavailable under that exact name; it is not trimmed. A malformed saved selection is reported as `(invalid saved mode)`. An invalid interactive `/mode` selection remains recoverable and does not replace the previous one; if saving fails, retry the command.
 
 The footer shows `mode: <name> (unavailable)` while restoration is in progress or the selected mode is unavailable, including after prompt-projection failure. For malformed saved data it shows `mode: (invalid saved mode) (unavailable)`. Detailed recovery reasons remain in existing reports, not the footer. Explicitly selecting `auto` or another valid mode restores the ready text.
 
