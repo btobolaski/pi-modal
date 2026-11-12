@@ -100,19 +100,44 @@ test("source-directory grouping honors configured/default directories and instru
   }
 });
 
-test("native outgoing requests project A to B to auto without changing source or history", async (t) => {
-  const f = await nativeFixture(t);
+test("native startup-prefix requests project A to B to auto without changing source or history", async (t) => {
+  const f = await nativeFixture(t, [
+    (pi) => {
+      pi.on("session_start", () => {
+        pi.sendMessage(
+          { customType: "startup", content: "STARTUP", display: false },
+          { triggerTurn: false },
+        );
+      });
+    },
+  ]);
+  const startup = structuredClone(f.session.messages[0]);
+  assert.equal(startup.role, "custom");
   const seen: string[] = [];
   f.faux.setResponses(
     [0, 1, 2, 3].map(() => (context) => {
+      assert.equal(context.messages[0].role, "user");
+      assert.deepEqual(context.messages[0].content, [
+        { type: "text", text: "STARTUP" },
+      ]);
+      assert.equal(context.messages[1].role, "system");
       seen.push(getCurrentSystemPrompt(context.messages));
       return fauxAssistantMessage("ok");
     }),
   );
   for (const id of ["A", "B", "auto", "none"]) {
+    const history = structuredClone(f.sm.getBranch());
     await f.session.prompt(`/mode ${id}`);
     await f.session.prompt("check");
+    assert.deepEqual(query(f), {
+      sessionId: f.sm.getSessionId(),
+      id,
+      ready: true,
+    });
+    assert.deepEqual(f.sm.getBranch().slice(0, history.length), history);
+    assert.deepEqual(f.session.messages[0], startup);
   }
+  assert.equal(seen.length, 4);
   const globalBlock = `<project_instructions path="${join(f.agentDir, "CLAUDE.md")}">\nGLOBAL\n</project_instructions>`;
   assert.ok(seen[0].includes(globalBlock));
   assert.equal(seen[0].includes("ANCESTOR"), false);
@@ -122,7 +147,11 @@ test("native outgoing requests project A to B to auto without changing source or
       `<project_instructions path="${join(f.dir, "AGENTS.md")}">\nA\n</project_instructions>`,
     ),
   );
-  assert.ok(seen[1].includes("GLOBAL\n\nB\n</project_instructions>"));
+  assert.equal(
+    seen[1].split("GLOBAL\n\nB\n</project_instructions>").length - 1,
+    1,
+  );
+  assert.doesNotMatch(seen[1], /\nA\n<\/project_instructions>/);
   assert.ok(seen[1].includes("ANCESTOR"));
   assert.ok(seen[1].includes("PROJECT"));
   assert.equal(seen[2], seen[3]);
@@ -222,27 +251,54 @@ function baseline() {
   return { files, blocks, section, options, messages, withSection };
 }
 test("request projection preserves unrelated sections, source input, content and tool deltas", () => {
-  const f = baseline(),
-    before = structuredClone(f.messages);
-  const result = projectMessages(
-    f.messages,
-    f.options,
-    mode("ReplaceProject"),
-    "/agent",
-  );
-  assert.deepEqual(f.messages, before);
-  const expected = structuredClone(getCurrentSystemMessage(f.messages)!);
-  expected.sections!.project_context = f.section.replace(
-    f.blocks[1],
-    block(f.files[1].path, "MODE"),
-  );
-  assert.deepEqual(
-    getCurrentSystemMessage(result),
-    expected,
-    "only project_context may change, including during tool replay",
-  );
-  assert.deepEqual(result[1], f.messages[1]);
-  assert.deepEqual(result[3], f.messages[3]);
+  const f = baseline();
+  const prefixes: Messages[] = [
+    [],
+    [
+      {
+        role: "custom",
+        customType: "startup",
+        content: "STARTUP",
+        display: false,
+        timestamp: 0,
+      },
+      { role: "user", content: "before system", timestamp: 0 },
+    ],
+  ];
+  for (const prefix of prefixes) {
+    const messages = [...prefix, ...f.messages];
+    const before = structuredClone(messages);
+    const result = projectMessages(
+      messages,
+      f.options,
+      mode("ReplaceProject"),
+      "/agent",
+    );
+    assert.deepEqual(messages, before);
+    const expected = structuredClone(getCurrentSystemMessage(messages)!);
+    expected.sections!.project_context = f.section.replace(
+      f.blocks[1],
+      block(f.files[1].path, "MODE"),
+    );
+    assert.deepEqual(
+      getCurrentSystemMessage(result),
+      expected,
+      "only project_context may change, including during tool replay",
+    );
+    assert.deepEqual(result, [
+      ...prefix,
+      {
+        ...f.messages[0],
+        sections: {
+          project_context: expected.sections!.project_context,
+          skills: "SKILLS",
+        },
+      },
+      f.messages[1],
+      { ...f.messages[2], sections: { extra: "EXTRA" } },
+      f.messages[3],
+    ]);
+  }
   assert.equal(
     projectMessages(f.messages, undefined, mode("None")),
     f.messages,
@@ -281,7 +337,7 @@ test("incompatible projection baselines fail atomically at their named guard", (
     ...f.options,
     forceSystemPrompt: "OPAQUE",
   });
-  reject(/Missing leading/, [f.messages[1]]);
+  reject(/Missing system message/, [f.messages[1]]);
   reject(/Missing project_context/, [
     { role: "system", content: "BASE", timestamp: 0 },
   ]);

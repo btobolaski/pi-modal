@@ -174,8 +174,8 @@ export function projectMessages(
     throw new Error(
       "Structured prompt inputs unavailable or an opaque forced prompt is active",
     );
-  if (messages[0]?.role !== "system")
-    throw new Error("Missing leading system message");
+  const systemIndex = messages.findIndex((message) => message.role === "system");
+  if (systemIndex === -1) throw new Error("Missing system message");
   const files = options.contextFiles;
   const transformed = transformGroups(files, mode, agentDir);
   if (new Set(transformed.map((file) => file.path)).size !== transformed.length)
@@ -239,7 +239,7 @@ export function projectMessages(
   }
   return messages.map((message, i) => {
     if (message.role !== "system") return message;
-    if (i === 0)
+    if (i === systemIndex)
       return {
         ...message,
         sections: { ...message.sections, project_context: section },
